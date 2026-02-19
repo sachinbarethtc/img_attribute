@@ -212,6 +212,7 @@ class DivisionDetection(BaseModel):
     division: str
     item_count: int = 1
     is_garment_visible: bool = True
+    is_coordinated_set: bool = False   # True when upper+lower worn together as a set
 
 class DepartmentDetection(BaseModel):
     department: Optional[str] = None

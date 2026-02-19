@@ -149,9 +149,11 @@ async def analyze_fashion_attributes(
         try:
             division_data = service.detect_division(contents, allowed_divisions)
             division = division_data.division
-            
-            # Check for multiple garments early
-            if division_data.item_count > 1:
+
+            # Block ONLY when multiple unrelated garments are present.
+            # A Coordinated Set (upper garment + lower garment worn together, e.g. shirt+pant,
+            # top+jeans, kurta+pyjama) is intentional and should pass through the full pipeline.
+            if division_data.item_count > 1 and not division_data.is_coordinated_set:
                 return FashionAttributeResponse(
                     division=division,
                     item_count=division_data.item_count,
@@ -165,10 +167,15 @@ async def analyze_fashion_attributes(
         # Stage 2: Detect Department
         allowed_departments = DIV_DEPT_MAPPING.get(division, [])
         department = service.detect_department(contents, division, allowed_departments)
-        
+
         # Stage 3: Remaining Attributes
-        final_result = service.extract_attributes(contents, division, department)
-        
+        # Forward is_coordinated_set so Stage 3 skips the multiple-garment guard
+        # and informs the LLM it is analysing a coordinated outfit.
+        final_result = service.extract_attributes(
+            contents, division, department,
+            is_coordinated_set=division_data.is_coordinated_set
+        )
+
         return final_result
 
     except HTTPException:

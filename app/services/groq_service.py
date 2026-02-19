@@ -232,6 +232,59 @@ from app.schemas import FashionAttributeResponse, DivisionDetection, DepartmentD
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Department Code Context
+# Naming convention:
+#   - T at the START of a compound code (e.g. T-B) means Teenage
+#   - T at the END of a compound code (e.g. BT, GT) means Toddler
+#   - Standalone "T" means Toddler (1–3 yrs)
+# ---------------------------------------------------------------------------
+DEPARTMENT_CODE_CONTEXT: Dict[str, str] = {
+    "B":   "Boys — Young boy wearing kids outfit",
+    "BJ":  "Boys Junior — Older boy (8–14 yrs) clothing",
+    "BT":  "Boys Toddler — Toddler boy clothing (1–3 yrs)",
+    "BS":  "Boys Senior — Teenage boy clothing (14+ yrs)",
+    "G":   "Girls — Young girl clothing",
+    "GJ":  "Girls Junior — Older girl (8–14 yrs) clothing",
+    "GT":  "Girls Toddler — Toddler girl clothing (1–3 yrs)",
+    "GS":  "Girls Senior — Teenage girl clothing (14+ yrs)",
+    "M":   "Men — Adult male clothing",
+    "W":   "Women — Adult female clothing",
+    "L":   "Ladies — Women traditional / formal clothing",
+    "I":   "Infant — Baby clothing (0–12 months)",
+    "IB":  "Infant Boys — Baby boy clothing (0–12 months)",
+    "IG":  "Infant Girls — Baby girl clothing (0–12 months)",
+    "T":   "Toddler — 1–3 year child clothing",
+    "T-B": "Teenage Boys — Teenage boy clothing (13–17 yrs)",
+    "WW":  "Women Western — Women's western-style clothing",
+}
+
+
+def build_department_context_string(departments: List[str]) -> str:
+    """
+    For a list of department names (e.g. ['T-Shirt [BJ]', 'T-Shirt [BS]', 'T-Shirt [M]']),
+    extract the audience codes from brackets and return an enriched reference table
+    that explains what each code means.
+    """
+    lines = ["Department options with audience context:"]
+    seen_codes: set = set()
+
+    for dept in departments:
+        # Extract all codes inside brackets, e.g. 'T-Shirt FS[BJ]' -> ['BJ']
+        codes = re.findall(r'\[([A-Z][A-Z0-9-]*)\]', dept)
+        code_meanings = []
+        for code in codes:
+            meaning = DEPARTMENT_CODE_CONTEXT.get(code)
+            if meaning and code not in seen_codes:
+                code_meanings.append(f"{code} = {meaning}")
+                seen_codes.add(code)
+        if code_meanings:
+            lines.append(f"  • {dept}  →  {', '.join(code_meanings)}")
+        else:
+            lines.append(f"  • {dept}")
+
+    return "\n".join(lines)
+
 def clean_json_response(content: str) -> str:
     """Removes markdown and extra text from LLM response."""
     # Remove markdown code blocks
@@ -259,76 +312,132 @@ class GroqService:
         return clean_json_response(completion.choices[0].message.content)
 
     def detect_division(self, image_bytes: bytes, allowed_divisions: List[str]) -> DivisionDetection:
-        """Stage 1: Detect Division, Item Count, and Visibility"""
+        """Stage 1: Detect Division, Item Count, Visibility, and Coordinated Set status."""
         system_prompt = (
-            f"You are a fashion expert. Return ONLY valid JSON with 'division', 'item_count', and 'is_garment_visible' keys. "
+            f"You are a fashion expert. Return ONLY valid JSON with these EXACT keys: "
+            f"'division', 'item_count', 'is_garment_visible', 'is_coordinated_set'. "
             f"Allowed division values: {', '.join(allowed_divisions)}. "
-            f"'item_count' is an integer. 'is_garment_visible' is a boolean."
+            f"'item_count' is an integer counting distinct garment pieces. "
+            f"'is_garment_visible' is a boolean (true if clearly visible, not blurred/folded/obscured). "
+            f"'is_coordinated_set' is a boolean — set to TRUE only when the person is wearing an "
+            f"UPPER garment (shirt/top/kurta/jacket etc.) AND a LOWER garment (pant/jeans/skirt/shorts etc.) "
+            f"TOGETHER as a matching or intentional coordinated outfit. "
+            f"Set 'is_coordinated_set' to FALSE if multiple separate/unrelated garments are present "
+            f"(e.g., two shirts, two tops) or if only a single garment is visible."
         )
         user_content = [
-            {"type": "text", "text": "Detect the division, count distinct garments, and check if the garments are clearly visible (not blurred, folded, or obscured)."},
+            {
+                "type": "text",
+                "text": (
+                    "Analyse this image carefully:\n"
+                    "1. Identify the garment division.\n"
+                    "2. Count distinct garment pieces (item_count).\n"
+                    "3. Check if the garment(s) are clearly visible (is_garment_visible).\n"
+                    "4. Check if the person is wearing an UPPER + LOWER garment together "
+                    "(shirt+pant, top+jeans, kurta+pyjama, etc.) — if yes, set is_coordinated_set=true."
+                )
+            },
             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encode_image(image_bytes)}"}}
         ]
-        
+
         raw_response = self._call_groq(system_prompt, user_content)
         data = json.loads(raw_response)
         div = str(data.get("division", "")).strip()
         item_count = int(data.get("item_count", 1))
         is_visible = bool(data.get("is_garment_visible", True))
-        
-        # Case-insensitive matching
+        is_coordinated_set = bool(data.get("is_coordinated_set", False))
+
+        # Case-insensitive division matching
         matched_div = None
         for allowed in allowed_divisions:
             if div.lower() == allowed.lower():
                 matched_div = allowed
                 break
-        
+
         if not matched_div:
             raise ValueError(f"Invalid division detected: '{div}'. Allowed: {allowed_divisions}")
-            
-        return DivisionDetection(division=matched_div, item_count=item_count, is_garment_visible=is_visible)
+
+        return DivisionDetection(
+            division=matched_div,
+            item_count=item_count,
+            is_garment_visible=is_visible,
+            is_coordinated_set=is_coordinated_set
+        )
 
     def detect_department(self, image_bytes: bytes, division: str, allowed_departments: List[str]) -> Optional[str]:
-        """Stage 2: Detect Department based on Division"""
+        """Stage 2: Detect Department based on Division and audience code context."""
         if not allowed_departments:
             return None
-            
+
+        # Build enriched context table so the LLM knows what each code suffix means
+        context_table = build_department_context_string(allowed_departments)
+
         system_prompt = (
-            f"You are a fashion expert. Detect the department for this '{division}' garment. "
-            f"Return ONLY JSON with 'department' key. You must pick from the provided list."
+            f"You are a fashion expert specialising in garment classification. "
+            f"Your task is to identify the most appropriate department for a '{division}' garment. "
+            f"Department names contain audience codes inside brackets (e.g. [BJ], [M], [W]). "
+            f"Each code indicates who the garment is designed for — a specific age group and gender. "
+            f"\n\n{context_table}"
+            f"\n\nINSTRUCTIONS:"
+            f"\n1. Carefully look at the garment AND the person wearing it (if visible)."
+            f"\n2. Estimate the wearer's apparent age group and gender from the image."
+            f"\n3. Match the garment type + age group + gender to the best department from the list."
+            f"\n4. Return ONLY valid JSON with a single key: 'department'."
+            f"\n5. The value MUST be copied exactly (character-for-character) from the allowed list."
         )
+
+        dept_list_str = "\n".join(f"  {i+1}. {d}" for i, d in enumerate(allowed_departments))
+        user_text = (
+            f"Division: {division}\n"
+            f"\nAllowed departments (pick EXACTLY one, copy the text as-is):\n{dept_list_str}\n"
+            f"\nAnalyse the image carefully — note the garment style and the apparent age/gender "
+            f"of the person wearing it — then return the best matching department as JSON."
+        )
+
         user_content = [
-            {"type": "text", "text": f"Select the most appropriate department from this list for the {division} garment: {', '.join(allowed_departments)}"},
+            {"type": "text", "text": user_text},
             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encode_image(image_bytes)}"}}
         ]
-        
+
         raw_response = self._call_groq(system_prompt, user_content)
         data = json.loads(raw_response)
         dept = str(data.get("department", "")).strip()
-        
-        # Exact case match for department as per requirements
+
+        # Exact match first
         if dept in allowed_departments:
             return dept
-        
-        # Fallback to case-insensitive if exact match fails
+
+        # Fallback: case-insensitive match
         for allowed in allowed_departments:
             if dept.lower() == allowed.lower():
                 return allowed
-                
+
         return None
 
-    def extract_attributes(self, image_bytes: bytes, division: str, department: Optional[str]) -> Dict[str, Any]:
-        """Stage 3: Extract remaining attributes with full context"""
+    def extract_attributes(
+        self,
+        image_bytes: bytes,
+        division: str,
+        department: Optional[str],
+        is_coordinated_set: bool = False
+    ) -> Dict[str, Any]:
+        """Stage 3: Extract remaining attributes with full context."""
+        coordinated_note = (
+            "NOTE: This image shows a COORDINATED SET — the person is wearing an upper garment "
+            "(e.g. shirt/top/kurta) AND a lower garment (e.g. pant/jeans/skirt) together as one outfit. "
+            "Extract attributes for the overall outfit, treating it as a single coordinated item.\n\n"
+            if is_coordinated_set else ""
+        )
+
         system_prompt = (
             "You are a professional fashion attribute extractor. Return ONLY valid JSON. "
             "If an attribute is not visible, set it to null. Use the specified allowed values strictly."
         )
-        
-        user_prompt = f"""
-Division: {division}
+
+        user_prompt = f"""Division: {division}
 Department: {department or 'N/A'}
 
-Extract these attributes carefully:
+{coordinated_note}Extract these attributes carefully:
 - item_count (integer)
 - is_garment_visible (boolean)
 - quality_issue (null if visible)
@@ -358,13 +467,14 @@ Return the output in the requested JSON structure.
         
         raw_response = self._call_groq(system_prompt, user_content)
         data = json.loads(raw_response)
-        
+
         # Enforce consistency
         data["division"] = division
         data["department"] = department
-        
-        # Check for multiple garments in final stage
-        if data.get("item_count", 1) > 1:
+
+        # Guard: block truly multiple unrelated garments.
+        # Skip this check for coordinated sets — they intentionally have item_count > 1.
+        if data.get("item_count", 1) > 1 and not is_coordinated_set:
             return FashionAttributeResponse(
                 division=division,
                 department=department,
@@ -372,6 +482,6 @@ Return the output in the requested JSON structure.
                 is_garment_visible=bool(data.get("is_garment_visible", True)),
                 message="There is multiple garments so upload single garment image."
             ).model_dump()
-            
+
         # Validate and return
         return FashionAttributeResponse(**data).model_dump()
