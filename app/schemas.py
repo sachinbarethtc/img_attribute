@@ -256,3 +256,41 @@ class FashionAttributeResponse(BaseModel):
 class ErrorResponse(BaseModel):
     error: str
     detail: Optional[str] = None
+
+
+
+# -------------------------------
+# Vendor Output Schema
+# -------------------------------
+
+class VendorAttribute(BaseModel):
+    no_of_pcs: Optional[str] = None
+    brand: Optional[str] = None
+    style_pattern: Optional[str] = None
+    assortment: Optional[str] = None
+    size: Optional[str] = None
+    color: Optional[str] = None
+    vendor_design: Optional[str] = None
+    fabric: Optional[str] = None
+    neck_waist: Optional[str] = None
+    fit: Optional[str] = None
+    sleeve_or_intensity: Optional[str] = None
+    sleeve_style: Optional[str] = None
+    product_type: Optional[str] = None
+    trend_design: Optional[str] = None
+    pattern_coverage_or_occasion: Optional[str] = None
+    garment_length: Optional[str] = None
+    pocket_type: Optional[str] = None
+    gender_wash: Optional[str] = None
+
+
+class VendorResult(BaseModel):
+    division: str
+    department: str
+    attributes: List[VendorAttribute]
+
+
+class VendorResponse(BaseModel):
+    success: bool
+    message: Optional[str] = None
+    result: Optional[VendorResult] = None
