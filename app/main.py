@@ -339,6 +339,10 @@ async def analyze_fashion_attributes(
             detail="Internal server error during processing."
         )
 
+@app.get("/")
+async def root():
+    return {"message": "API is running"}
+
 
 if __name__ == "__main__":
     import uvicorn
