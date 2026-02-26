@@ -313,17 +313,25 @@ class GroqService:
 
     def detect_division(self, image_bytes: bytes, allowed_divisions: List[str]) -> DivisionDetection:
         """Stage 1: Detect Division, Item Count, Visibility, and Coordinated Set status."""
+        divisions_formatted = "\n".join(f"  - {d}" for d in allowed_divisions)
         system_prompt = (
             f"You are a fashion expert. Return ONLY valid JSON with these EXACT keys: "
             f"'division', 'item_count', 'is_garment_visible', 'is_coordinated_set'. "
-            f"Allowed division values: {', '.join(allowed_divisions)}. "
-            f"'item_count' is an integer counting distinct garment pieces. "
+            f"For 'division', you MUST copy one value VERBATIM (character-for-character) from this list:\n"
+            f"{divisions_formatted}\n"
+            f"Do NOT shorten, abbreviate, or paraphrase the division name. "
+            f"For example, if the list has 'Women Ethnic' and 'Women Western', never return just 'Women'. "
+            f"'item_count' is an integer counting ALL distinct garment pieces visible. "
             f"'is_garment_visible' is a boolean (true if clearly visible, not blurred/folded/obscured). "
-            f"'is_coordinated_set' is a boolean — set to TRUE only when the person is wearing an "
-            f"UPPER garment (shirt/top/kurta/jacket etc.) AND a LOWER garment (pant/jeans/skirt/shorts etc.) "
-            f"TOGETHER as a matching or intentional coordinated outfit. "
-            f"Set 'is_coordinated_set' to FALSE if multiple separate/unrelated garments are present "
-            f"(e.g., two shirts, two tops) or if only a single garment is visible."
+            f"'is_coordinated_set' is a boolean with STRICT rules — "
+            f"set to TRUE ONLY when ALL these conditions are met: "
+            f"(1) there is EXACTLY ONE upper garment (shirt/top/kurta/jacket etc.), "
+            f"(2) there is EXACTLY ONE lower garment (pant/jeans/skirt/shorts etc.), "
+            f"(3) they form a SINGLE coordinated outfit (worn together or intentionally paired). "
+            f"Set 'is_coordinated_set' to FALSE in ALL other cases, including: "
+            f"multiple outfits displayed together (e.g. 2 sets side by side on hangers), "
+            f"two separate tops, two separate bottoms, or any other combination beyond one upper + one lower. "
+            f"IMPORTANT: Two coordinated sets displayed together = is_coordinated_set FALSE."
         )
         user_content = [
             {
@@ -331,10 +339,11 @@ class GroqService:
                 "text": (
                     "Analyse this image carefully:\n"
                     "1. Identify the garment division.\n"
-                    "2. Count distinct garment pieces (item_count).\n"
+                    "2. Count ALL distinct garment pieces visible (item_count).\n"
                     "3. Check if the garment(s) are clearly visible (is_garment_visible).\n"
-                    "4. Check if the person is wearing an UPPER + LOWER garment together "
-                    "(shirt+pant, top+jeans, kurta+pyjama, etc.) — if yes, set is_coordinated_set=true."
+                    "4. is_coordinated_set = true ONLY if there is exactly ONE top + ONE bottom forming "
+                    "a single coordinated outfit. If you see 2 or more outfits/sets/pairs "
+                    "displayed (even if each pair is upper+lower), set is_coordinated_set = false."
                 )
             },
             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encode_image(image_bytes)}"}}
@@ -347,12 +356,29 @@ class GroqService:
         is_visible = bool(data.get("is_garment_visible", True))
         is_coordinated_set = bool(data.get("is_coordinated_set", False))
 
-        # Case-insensitive division matching
+        # Tier 1: exact case-insensitive match
         matched_div = None
         for allowed in allowed_divisions:
             if div.lower() == allowed.lower():
                 matched_div = allowed
                 break
+
+        # Tier 2: prefix / starts-with match (handles 'Women' → 'Women Western' / 'Women Ethnic')
+        if not matched_div:
+            prefix_matches = [a for a in allowed_divisions if a.lower().startswith(div.lower())]
+            if len(prefix_matches) == 1:
+                # Unambiguous single prefix match — safe to use
+                matched_div = prefix_matches[0]
+                logger.warning(
+                    f"Division '{div}' resolved via prefix match to '{matched_div}'. "
+                    f"Prompt may need tuning."
+                )
+            elif len(prefix_matches) > 1:
+                # Ambiguous — can't safely pick one, raise error
+                raise ValueError(
+                    f"Ambiguous division '{div}' matches multiple: {prefix_matches}. "
+                    f"LLM must return the full exact name."
+                )
 
         if not matched_div:
             raise ValueError(f"Invalid division detected: '{div}'. Allowed: {allowed_divisions}")
@@ -485,3 +511,51 @@ Return the output in the requested JSON structure.
 
         # Validate and return
         return FashionAttributeResponse(**data).model_dump()
+    
+
+    # --------------------------------------------------
+    # Mapping Internal Schema → Vendor Format
+    # --------------------------------------------------
+
+    def map_internal_to_vendor(self, internal_data: Dict[str, Any]) -> Dict[str, Any]:
+
+        # Handle error cases (multiple garments etc.)
+        if internal_data.get("message") and internal_data.get("item_count", 1) > 1:
+            return {
+                "success": False,
+                "message": internal_data.get("message"),
+                "result": None
+            }
+
+        attribute = {
+            "no_of_pcs": str(internal_data.get("item_count", 1)),
+            "brand": None,  # Not predicted yet
+            "style_pattern": internal_data.get("pattern"),
+            "assortment": "SINGLE",
+            "size": None,  # Not predicted yet
+            "color": internal_data.get("color"),
+            "vendor_design": internal_data.get("style")[0] if internal_data.get("style") else None,
+            "fabric": internal_data.get("material_type"),
+            "neck_waist": internal_data.get("neckline"),
+            "fit": internal_data.get("fit"),
+            "sleeve_or_intensity": internal_data.get("sleeve_length"),
+            "sleeve_style": None,
+            "product_type": internal_data.get("department"),
+            "trend_design": internal_data.get("pattern"),
+            "pattern_coverage_or_occasion": (
+                internal_data.get("occasion")[0] if internal_data.get("occasion") else None
+            ),
+            "garment_length": internal_data.get("garment_length"),
+            "pocket_type": internal_data.get("pocket_type"),
+            "gender_wash": internal_data.get("gender"),
+        }
+
+        return {
+            "success": True,
+            "message": internal_data.get("message"),
+            "result": {
+                "division": internal_data.get("division"),
+                "department": internal_data.get("department"),
+                "attributes": [attribute]
+            }
+        }
