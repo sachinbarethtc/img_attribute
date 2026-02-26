@@ -198,6 +198,7 @@ from app.schemas import VendorResponse, ErrorResponse
 from app.services.groq_service import GroqService
 from app.utils import load_divisions_and_departments
 import logging
+import os
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -211,7 +212,8 @@ DIV_DEPT_MAPPING = {}
 async def lifespan(app: FastAPI):
     # Load Excel on startup
     global DIV_DEPT_MAPPING
-    excel_path = "division.xlsx"
+    # Use absolute path based on the current file location
+    excel_path = os.path.join(os.path.dirname(__file__), '..', 'division.xlsx')
     try:
         DIV_DEPT_MAPPING = load_divisions_and_departments(excel_path)
         logger.info(f"Successfully loaded {len(DIV_DEPT_MAPPING)} divisions from {excel_path}")
@@ -346,4 +348,6 @@ async def root():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)
+    import os
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("app.main:app", host="0.0.0.0", port=port)
